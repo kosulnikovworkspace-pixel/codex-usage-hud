@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Codex Usage HUD",
+  "description": "Shows Codex usage on ChatGPT using your current web session.",
+  "version": "0.1.0",
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["src/usage-client.js", "src/format.js", "src/content.js"],
+      "css": ["src/hud.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

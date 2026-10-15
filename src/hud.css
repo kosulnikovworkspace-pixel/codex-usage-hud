@@ -1,0 +1,64 @@
+#codex-usage-hud {
+  position: fixed;
+  top: 76px;
+  right: 18px;
+  z-index: 2147483647;
+  box-sizing: border-box;
+  width: 236px;
+  max-width: calc(100vw - 24px);
+  padding: 11px 12px;
+  border: 1px solid #d6dbe2;
+  border-radius: 12px;
+  background: #fff;
+  color: #202631;
+  box-shadow: 0 5px 20px #1118271c;
+  font: 12px/1.4 system-ui, -apple-system, sans-serif;
+}
+
+#codex-usage-hud, #codex-usage-hud * { box-sizing: border-box; }
+#codex-usage-hud [hidden] { display: none !important; }
+#codex-usage-hud .codex-hud__header,
+#codex-usage-hud .codex-hud__metric,
+#codex-usage-hud .codex-hud__reset { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+#codex-usage-hud .codex-hud__header { min-height: 24px; }
+#codex-usage-hud .codex-hud__title { font-size: 11px; letter-spacing: .08em; white-space: nowrap; }
+#codex-usage-hud .codex-hud__actions { display: flex; margin-left: auto; gap: 2px; }
+#codex-usage-hud .codex-hud__button { width: 24px; height: 24px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: inherit; font: 17px/1 system-ui, sans-serif; cursor: pointer; }
+#codex-usage-hud .codex-hud__button:hover { background: #e8edf2; }
+#codex-usage-hud .codex-hud__button:focus-visible { outline: 2px solid #26836b; outline-offset: 1px; }
+#codex-usage-hud .codex-hud__button:disabled { opacity: .45; cursor: default; }
+#codex-usage-hud .codex-hud__button--loading { animation: codex-hud-spin 1s linear infinite; }
+#codex-usage-hud .codex-hud__details { margin-top: 8px; }
+#codex-usage-hud .codex-hud__metric { margin-top: 7px; }
+#codex-usage-hud .codex-hud__label, #codex-usage-hud .codex-hud__reset, #codex-usage-hud .codex-hud__footer { color: #657082; }
+#codex-usage-hud .codex-hud__value { font-weight: 600; font-variant-numeric: tabular-nums; }
+#codex-usage-hud .codex-hud__track { height: 4px; margin-top: 4px; overflow: hidden; border-radius: 3px; background: #e8edf2; }
+#codex-usage-hud .codex-hud__fill { height: 100%; border-radius: inherit; background: #26836b; }
+#codex-usage-hud .codex-hud__today { margin-top: 10px; }
+#codex-usage-hud .codex-hud__resets { margin-top: 11px; padding-top: 8px; border-top: 1px solid #e8edf2; }
+#codex-usage-hud .codex-hud__reset { margin-top: 3px; font-variant-numeric: tabular-nums; }
+#codex-usage-hud .codex-hud__footer { margin-top: 9px; font-size: 11px; }
+#codex-usage-hud .codex-hud__status { display: block; margin-top: 3px; color: #a05e23; font-size: 11px; }
+#codex-usage-hud .codex-hud__compact { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-variant-numeric: tabular-nums; }
+#codex-usage-hud.codex-hud--collapsed { width: auto; max-width: calc(100vw - 24px); padding: 6px 8px; }
+#codex-usage-hud.codex-hud--collapsed .codex-hud__title { letter-spacing: 0; }
+
+@media (prefers-color-scheme: dark) {
+  #codex-usage-hud { border-color: #414a55; background: #252b33; color: #f3f5f7; box-shadow: 0 5px 20px #0006; }
+  #codex-usage-hud .codex-hud__label, #codex-usage-hud .codex-hud__reset, #codex-usage-hud .codex-hud__footer { color: #acb6c2; }
+  #codex-usage-hud .codex-hud__button:hover, #codex-usage-hud .codex-hud__track { background: #3c4652; }
+  #codex-usage-hud .codex-hud__resets { border-color: #3c4652; }
+  #codex-usage-hud .codex-hud__fill { background: #66c5a7; }
+  #codex-usage-hud .codex-hud__status { color: #e6b17d; }
+}
+
+@media (max-width: 560px) {
+  #codex-usage-hud { top: 66px; right: 8px; width: min(210px, calc(100vw - 16px)); }
+  #codex-usage-hud.codex-hud--collapsed { max-width: calc(100vw - 16px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #codex-usage-hud .codex-hud__button--loading { animation: none; }
+}
+
+@keyframes codex-hud-spin { to { transform: rotate(360deg); } }
