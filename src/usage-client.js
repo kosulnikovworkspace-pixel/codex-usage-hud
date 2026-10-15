@@ -11,7 +11,6 @@
   const ONE_WEEK = 7 * 24 * 60 * 60;
 
   const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-  const firstObject = (...values) => values.find(object) || null;
   const number = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
 
   function percent(value) {
@@ -79,40 +78,83 @@
 
   function rowDay(value) {
     if (typeof value !== "string") return null;
-    const match = /^(\d{4}-\d{2}-\d{2})(?:$|T)/.exec(value);
-    return match ? match[1] : null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) ? localDay(timestamp) : null;
   }
 
-  function tokenCount(row) {
-    const usage = firstObject(row.usage, row.token_usage);
-    for (const source of [row, usage]) {
-      if (!source) continue;
-      const n = number(source.total_tokens ?? source.totalTokens ?? source.token_count ?? source.tokenCount ?? source.tokens);
-      if (n !== null && n >= 0 && Number.isSafeInteger(n)) return n;
+  function dailyRecords(payload) {
+    if (Array.isArray(payload)) return payload;
+    if (!object(payload)) return null;
+    for (const source of [payload, payload.data]) {
+      if (!object(source)) continue;
+      for (const key of ["data", "daily_usage", "dailyUsage", "daily_counts", "dailyCounts", "records", "items", "results"]) {
+        if (Array.isArray(source[key])) return source[key];
+      }
+    }
+    return null;
+  }
+
+  function tokenCount(source) {
+    if (!object(source)) return null;
+    const tokenNumber = (value) => {
+      const candidate = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : number(value);
+      return candidate !== null && Number.isSafeInteger(candidate) && candidate >= 0 ? candidate : null;
+    };
+    const total = tokenNumber(source.text_total_tokens ?? source.total_tokens ?? source.totalTokens ??
+      source.token_count ?? source.tokenCount ?? source.tokens);
+    const uncached = tokenNumber(source.uncached_text_input_tokens);
+    const cached = tokenNumber(source.cached_text_input_tokens);
+    const output = tokenNumber(source.text_output_tokens);
+    if ([uncached, cached, output].some((value) => value === null)) return total;
+    const sum = uncached + cached + output;
+    if (total !== null && total > 0) return total;
+    return Number.isSafeInteger(sum) ? sum : total;
+  }
+
+  function dailyRecord(row) {
+    if (!object(row)) return null;
+    const day = rowDay(row.date ?? row.day ?? row.usage_date ?? row.usageDate ?? row.bucket_date);
+    if (!day) return null;
+    const product = row.product_surface ?? row.productSurface ?? row.product;
+    if (typeof product === "string" && !/codex/i.test(product)) return null;
+    for (const source of [row.totals, row.usage, row.token_usage, row]) {
+      const tokens = tokenCount(source);
+      if (tokens !== null) return { day, tokens };
     }
     return null;
   }
 
   function parseToday(payload, now = Date.now()) {
-    if (!object(payload) && !Array.isArray(payload)) return null;
     const day = localDay(now);
-    if (!day) return null;
-    const rows = [payload, payload.daily_usage, payload.dailyUsage, payload.daily_counts, payload.dailyCounts,
-      payload.data, payload.items, payload.results].find(Array.isArray);
-    if (!rows) return null;
-
+    const rows = dailyRecords(payload);
+    if (!day || !rows) return null;
     let tokens = 0;
     let found = false;
     for (const row of rows) {
-      if (!object(row) || rowDay(row.date ?? row.day ?? row.usage_date ?? row.usageDate ?? row.bucket_date) !== day) continue;
-      const product = row.product_surface ?? row.productSurface ?? row.product;
-      if (typeof product === "string" && !/codex/i.test(product)) continue;
-      const count = tokenCount(row);
-      if (count === null || !Number.isSafeInteger(tokens + count)) continue;
-      tokens += count;
+      const record = dailyRecord(row);
+      if (!record || record.day !== day) continue;
+      if (!Number.isSafeInteger(tokens + record.tokens)) return null;
+      tokens += record.tokens;
       found = true;
     }
     return found ? { tokens, day } : null;
+  }
+
+  function analyticsSchema(payload) {
+    const rootKeys = object(payload) ? Object.keys(payload).slice(0, 32) : [];
+    const rows = dailyRecords(payload);
+    const safeKeys = (keys) => keys.map((key) => key.slice(0, 80));
+    return {
+      httpStatus: 200,
+      isArray: Array.isArray(payload),
+      rootType: payload === null ? "null" : Array.isArray(payload) ? "array" : typeof payload,
+      rootKeys: safeKeys(rootKeys),
+      rootFieldTypes: Object.fromEntries(rootKeys.map((key) => [key.slice(0, 80),
+        payload[key] === null ? "null" : Array.isArray(payload[key]) ? "array" : typeof payload[key]])),
+      firstRecordKeys: object(rows?.[0]) ? safeKeys(Object.keys(rows[0]).slice(0, 32)) : [],
+      at: new Date().toISOString()
+    };
   }
 
   function diagnostic(stage, code, status = null) {
@@ -200,7 +242,10 @@
     let today = null;
     if (analyticsResult.status === "fulfilled") {
       today = parseToday(analyticsResult.value, now);
-      if (!today) diagnostics.push(diagnostic("parsing", "ANALYTICS_UNRECOGNIZED"));
+      if (!today) {
+        diagnostics.push(diagnostic("parsing", "ANALYTICS_UNRECOGNIZED"));
+        console.warn("[Codex Usage HUD] analytics schema:", analyticsSchema(analyticsResult.value));
+      }
     } else {
       diagnostics.push(analyticsResult.reason?.diagnostic ?? diagnostic("analytics", "UNKNOWN_ERROR"));
     }

@@ -63,13 +63,60 @@ test("analytics parser counts only valid Codex token rows for today", () => {
     { date: day, product: "chat", total_tokens: 999 },
     { date: "2026-10-14", product: "codex", total_tokens: 100 },
     { date: day, product: "codex", total_tokens: "50" }
-  ] }, now), { tokens: 428, day });
+  ] }, now), { tokens: 478, day });
   assert.equal(client.parseToday({ data: [{ date: day, request_count: 10 }] }, now), null);
   assert.equal(client.parseToday({}, now), null);
   const url = new URL(client.dailyUrl(now));
   assert.equal(url.searchParams.get("start_date"), day);
   assert.equal(url.searchParams.get("group_by"), "day");
   assert.equal(url.searchParams.get("end_date"), "2026-10-16");
+});
+
+test("analytics data.totals supports reported total and token components", () => {
+  const now = new Date(2026, 9, 15, 12).getTime();
+  const payload = { data: [
+    { date: "2026-10-14", totals: { text_total_tokens: 999999 } },
+    { date: "2026-10-15", totals: {
+      uncached_text_input_tokens: 200000,
+      cached_text_input_tokens: 180000,
+      text_output_tokens: 48000,
+      credits: 12,
+      turns: 9
+    } }
+  ] };
+  assert.deepEqual(client.parseToday(payload, now), { day: "2026-10-15", tokens: 428000 });
+  assert.deepEqual(client.parseToday({ data: [{ date: "2026-10-15", totals: {
+    text_total_tokens: 1200000,
+    uncached_text_input_tokens: 100,
+    cached_text_input_tokens: 100,
+    text_output_tokens: 100
+  } }] }, now), { day: "2026-10-15", tokens: 1200000 });
+  assert.equal(format.tokens(1200000), "1.2M");
+});
+
+test("analytics finds today in multiple wrappers and sums matching records", () => {
+  const now = new Date(2026, 9, 15, 12).getTime();
+  const rows = [
+    { date: "2026-10-14", totals: { text_total_tokens: 500 } },
+    { date: "2026-10-15", totals: { text_total_tokens: 300 } },
+    { date: "2026-10-15", totals: { text_total_tokens: 128 } }
+  ];
+  assert.deepEqual(client.parseToday(rows, now), { day: "2026-10-15", tokens: 428 });
+  assert.deepEqual(client.parseToday({ data: { records: rows } }, now), { day: "2026-10-15", tokens: 428 });
+});
+
+test("analytics returns unavailable for empty, unknown, or malformed token data", () => {
+  const now = new Date(2026, 9, 15, 12).getTime();
+  assert.equal(client.parseToday({ data: [] }, now), null);
+  assert.equal(client.parseToday({ unexpected: [{ date: "2026-10-15", total_tokens: 1 }] }, now), null);
+  assert.equal(client.parseToday(null, now), null);
+  assert.equal(client.parseToday({ data: [{ date: "2026-10-15", totals: { credits: 3, turns: 2 } }] }, now), null);
+  assert.equal(client.parseToday({ data: [{ date: "2026-10-15", totals: {
+    uncached_text_input_tokens: 4, text_output_tokens: 2
+  } }] }, now), null);
+  assert.deepEqual(client.parseToday({ data: [{ date: "2026-10-15", totals: { text_total_tokens: 0 } }] }, now), {
+    day: "2026-10-15", tokens: 0
+  });
 });
 
 test("formats missing values, compact tokens, and resets", () => {
@@ -118,13 +165,39 @@ test("combines quota and analytics when both endpoints succeed", async () => {
   const day = client.parseToday([{ date: "2026-10-15", total_tokens: 1 }], now).day;
   mockRequests({
     quota: { rate_limit: { primary_window: windowValue(18000, 50), secondary_window: windowValue(604800, 10) } },
-    analytics: { daily_usage: [{ date: day, total_tokens: 1234 }] }
+    analytics: { data: [{ date: day, totals: {
+      uncached_text_input_tokens: 1000,
+      cached_text_input_tokens: 200,
+      text_output_tokens: 34
+    } }] }
   });
   const result = await client.loadUsage(now);
   assert.equal(result.snapshot.fiveHour.usedPercent, 50);
   assert.equal(result.snapshot.weekly.usedPercent, 10);
   assert.equal(result.snapshot.today.tokens, 1234);
   assert.deepEqual(result.diagnostics, []);
+});
+
+test("analytics schema warning contains keys and types, never response values", async () => {
+  const oldWarn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args);
+  try {
+    mockRequests({
+      quota: { rate_limit: { primary_window: windowValue(18000, 25) } },
+      analytics: { data: [{ date: "2026-10-15", totals: { credits: 3 }, secret: "private-value" }] }
+    });
+    const result = await client.loadUsage(new Date(2026, 9, 15, 12).getTime());
+    assert.equal(result.snapshot.fiveHour.usedPercent, 25);
+    assert.equal(result.snapshot.today, null);
+    assert.equal(result.diagnostics[0].code, "ANALYTICS_UNRECOGNIZED");
+    assert.equal(warnings[0][0], "[Codex Usage HUD] analytics schema:");
+    assert.deepEqual(warnings[0][1].rootKeys, ["data"]);
+    assert.ok(warnings[0][1].firstRecordKeys.includes("totals"));
+    assert.equal(JSON.stringify(warnings).includes("private-value"), false);
+  } finally {
+    console.warn = oldWarn;
+  }
 });
 
 test("missing session token and two failed sources return safe diagnostics", async () => {
