@@ -2,9 +2,13 @@
 (() => {
   "use strict";
 
-  const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
-  const DAILY_URL = "https://chatgpt.com/backend-api/wham/analytics/daily-workspace-usage-counts";
+  const ORIGIN = "https://chatgpt.com";
+  const SESSION_URL = `${ORIGIN}/api/auth/session`;
+  const USAGE_URL = `${ORIGIN}/backend-api/wham/usage`;
+  const DAILY_URL = `${ORIGIN}/backend-api/wham/analytics/daily-workspace-usage-counts`;
   const TIMEOUT_MS = 15000;
+  const FIVE_HOURS = 5 * 60 * 60;
+  const ONE_WEEK = 7 * 24 * 60 * 60;
 
   const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
   const firstObject = (...values) => values.find(object) || null;
@@ -37,19 +41,40 @@
 
   function parseLimits(payload) {
     if (!object(payload)) return null;
-    for (const rate of [payload.rate_limit, payload.rateLimit, payload.codex_rate_limit, payload]) {
-      if (!object(rate)) continue;
-      const fiveHour = windowData(rate.primary_window ?? rate.primaryWindow ?? rate.five_hour ?? rate.fiveHour);
-      const weekly = windowData(rate.secondary_window ?? rate.secondaryWindow ?? rate.weekly_window ?? rate.weekly);
-      if (fiveHour || weekly) return { fiveHour, weekly };
+    const result = { fiveHour: null, weekly: null };
+    const seen = new Set();
+    function visit(value, depth) {
+      if (depth > 5 || value === null || typeof value !== "object" || seen.has(value)) return;
+      seen.add(value);
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item, depth + 1);
+        return;
+      }
+      const seconds = number(value.limit_window_seconds ?? value.limitWindowSeconds);
+      const data = windowData(value);
+      if (seconds !== null && data) {
+        if (Math.abs(seconds - FIVE_HOURS) <= 60 && !result.fiveHour) result.fiveHour = data;
+        if (Math.abs(seconds - ONE_WEEK) <= 60 && !result.weekly) result.weekly = data;
+      }
+      for (const key of ["rate_limit", "rateLimit", "codex_rate_limit", "primary_window", "primaryWindow",
+        "secondary_window", "secondaryWindow", "additional_rate_limits", "additionalRateLimits"]) {
+        visit(value[key], depth + 1);
+      }
     }
-    return null;
+    visit(payload, 0);
+    return result.fiveHour || result.weekly ? result : null;
   }
 
   function localDay(now) {
     const d = new Date(now);
     if (!Number.isFinite(d.getTime())) return null;
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+
+  function nextLocalDay(now) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 1);
+    return localDay(d.getTime());
   }
 
   function rowDay(value) {
@@ -90,42 +115,108 @@
     return found ? { tokens, day } : null;
   }
 
-  async function requestJson(url) {
+  function diagnostic(stage, code, status = null) {
+    return { stage, status, code, at: new Date().toISOString() };
+  }
+
+  // Never attach the response body or request headers to an error.
+  function requestError(stage, code, status = null) {
+    return { diagnostic: diagnostic(stage, code, status) };
+  }
+
+  async function requestJson(url, stage, auth = null) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    const headers = { Accept: "application/json" };
+    if (auth) {
+      headers.Authorization = `Bearer ${auth.accessToken}`;
+      if (auth.accountId) headers["ChatGPT-Account-Id"] = auth.accountId;
+    }
     try {
-      const response = await fetch(url, {
-        credentials: "include",
-        cache: "no-store",
-        headers: { Accept: "application/json" },
-        signal: controller.signal
-      });
-      if (!response.ok) throw new Error("Usage request failed");
-      return await response.json();
+      let response;
+      try {
+        response = await fetch(url, {
+          credentials: "include", cache: "no-store", headers, signal: controller.signal
+        });
+      } catch (error) {
+        throw requestError(stage, error?.name === "AbortError" ? "TIMEOUT" : "NETWORK_ERROR");
+      }
+      if (!response.ok) throw requestError(stage, "HTTP_ERROR", response.status);
+      try {
+        return await response.json();
+      } catch (_) {
+        throw requestError(stage, "INVALID_JSON");
+      }
     } finally {
       clearTimeout(timeout);
     }
   }
 
+  function sessionAuth(payload) {
+    if (!object(payload)) return null;
+    const accessToken = payload.accessToken ?? payload.access_token;
+    if (typeof accessToken !== "string" || !accessToken.trim()) return null;
+    const candidate = payload.account?.id ?? payload.accountId ?? payload.account_id;
+    const accountId = typeof candidate === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(candidate)
+      ? candidate : null;
+    return { accessToken, accountId };
+  }
+
+  function dailyUrl(now) {
+    const url = new URL(DAILY_URL);
+    url.searchParams.set("start_date", localDay(now));
+    url.searchParams.set("end_date", nextLocalDay(now)); // Exclusive end date.
+    url.searchParams.set("group_by", "day");
+    return url.toString();
+  }
+
   async function loadUsage(now = Date.now()) {
-    const [limitsResult, dailyResult] = await Promise.allSettled([
-      requestJson(USAGE_URL), requestJson(DAILY_URL)
+    const diagnostics = [];
+    let auth;
+    try {
+      auth = sessionAuth(await requestJson(SESSION_URL, "session"));
+      if (!auth) throw requestError("session", "NO_ACCESS_TOKEN");
+    } catch (error) {
+      diagnostics.push(error?.diagnostic ?? diagnostic("session", "UNKNOWN_ERROR"));
+      return { snapshot: null, diagnostics };
+    }
+
+    // Both sources settle independently; a failed analytics request cannot hide quota data.
+    const [quotaResult, analyticsResult] = await Promise.allSettled([
+      requestJson(USAGE_URL, "quota", auth),
+      requestJson(dailyUrl(now), "analytics", auth)
     ]);
-    const limits = limitsResult.status === "fulfilled" ? parseLimits(limitsResult.value) : null;
-    const today = dailyResult.status === "fulfilled" ? parseToday(dailyResult.value, now) : null;
-    if (!limits && !today) throw new Error("Usage data unavailable");
+    // Drop our explicit reference to the token before returning any result.
+    auth = null;
+
+    let limits = null;
+    if (quotaResult.status === "fulfilled") {
+      limits = parseLimits(quotaResult.value);
+      if (!limits) diagnostics.push(diagnostic("parsing", "QUOTA_UNRECOGNIZED"));
+    } else {
+      diagnostics.push(quotaResult.reason?.diagnostic ?? diagnostic("quota", "UNKNOWN_ERROR"));
+    }
+
+    let today = null;
+    if (analyticsResult.status === "fulfilled") {
+      today = parseToday(analyticsResult.value, now);
+      if (!today) diagnostics.push(diagnostic("parsing", "ANALYTICS_UNRECOGNIZED"));
+    } else {
+      diagnostics.push(analyticsResult.reason?.diagnostic ?? diagnostic("analytics", "UNKNOWN_ERROR"));
+    }
+
     return {
-      snapshot: {
+      snapshot: limits || today ? {
         fiveHour: limits?.fiveHour ?? null,
         weekly: limits?.weekly ?? null,
         today,
         updatedAt: new Date(now).toISOString()
-      },
-      partial: !limits || !today || limitsResult.status === "rejected" || dailyResult.status === "rejected"
+      } : null,
+      diagnostics
     };
   }
 
-  const client = { loadUsage, parseLimits, parseToday, resetTime };
+  const client = { loadUsage, parseLimits, parseToday, resetTime, dailyUrl };
   globalThis.CodexUsageClient = client;
   if (typeof module !== "undefined" && module.exports) module.exports = client;
 })();

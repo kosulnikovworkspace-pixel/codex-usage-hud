@@ -128,6 +128,11 @@
     return pendingSave;
   }
 
+  function diagnosticLabel(item) {
+    const detail = item.status === null ? item.code : `HTTP ${item.status}`;
+    return `${item.stage} ${detail}`;
+  }
+
   function refresh() {
     if (requestInFlight) return requestInFlight;
     loading = true;
@@ -135,17 +140,28 @@
     render();
     requestInFlight = globalThis.CodexUsageClient.loadUsage()
       .then((result) => {
+        if (result.diagnostics.length) {
+          // Diagnostics contain only stage, status, code, and timestamp.
+          console.warn("[Codex Usage HUD]", result.diagnostics);
+        }
+        const detail = result.diagnostics.map(diagnosticLabel).join(" · ");
+        if (!result.snapshot) {
+          status = `${snapshot ? "Last update failed · showing saved data" : "Usage data unavailable"}${detail ? ` · ${detail}` : ""}`;
+          return;
+        }
         snapshot = {
           fiveHour: result.snapshot.fiveHour ?? snapshot?.fiveHour ?? null,
           weekly: result.snapshot.weekly ?? snapshot?.weekly ?? null,
           today: result.snapshot.today ?? snapshot?.today ?? null,
           updatedAt: result.snapshot.updatedAt
         };
-        status = result.partial ? "Some data unavailable" : "";
+        status = detail ? `Some data unavailable · ${detail}` : "";
         return persist().catch(() => {});
       })
       .catch(() => {
-        status = snapshot ? "Last update failed · showing saved data" : "Usage data unavailable";
+        const detail = { stage: "parsing", status: null, code: "UNEXPECTED_ERROR", at: new Date().toISOString() };
+        console.warn("[Codex Usage HUD]", [detail]);
+        status = `${snapshot ? "Last update failed · showing saved data" : "Usage data unavailable"} · ${diagnosticLabel(detail)}`;
       })
       .finally(() => {
         loading = false;

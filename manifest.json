@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Codex Usage HUD",
   "description": "Shows Codex usage on ChatGPT using your current web session.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "permissions": ["storage"],
   "content_scripts": [
     {
