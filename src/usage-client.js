@@ -5,7 +5,6 @@
   const ORIGIN = "https://chatgpt.com";
   const SESSION_URL = `${ORIGIN}/api/auth/session`;
   const USAGE_URL = `${ORIGIN}/backend-api/wham/usage`;
-  const DAILY_URL = `${ORIGIN}/backend-api/wham/analytics/daily-workspace-usage-counts`;
   const TIMEOUT_MS = 15000;
   const FIVE_HOURS = 5 * 60 * 60;
   const ONE_WEEK = 7 * 24 * 60 * 60;
@@ -64,99 +63,6 @@
     return result.fiveHour || result.weekly ? result : null;
   }
 
-  function localDay(now) {
-    const d = new Date(now);
-    if (!Number.isFinite(d.getTime())) return null;
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  }
-
-  function nextLocalDay(now) {
-    const d = new Date(now);
-    d.setDate(d.getDate() + 1);
-    return localDay(d.getTime());
-  }
-
-  function rowDay(value) {
-    if (typeof value !== "string") return null;
-    if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
-    const timestamp = Date.parse(value);
-    return Number.isFinite(timestamp) ? localDay(timestamp) : null;
-  }
-
-  function dailyRecords(payload) {
-    if (Array.isArray(payload)) return payload;
-    if (!object(payload)) return null;
-    for (const source of [payload, payload.data]) {
-      if (!object(source)) continue;
-      for (const key of ["data", "daily_usage", "dailyUsage", "daily_counts", "dailyCounts", "records", "items", "results"]) {
-        if (Array.isArray(source[key])) return source[key];
-      }
-    }
-    return null;
-  }
-
-  function tokenCount(source) {
-    if (!object(source)) return null;
-    const tokenNumber = (value) => {
-      const candidate = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : number(value);
-      return candidate !== null && Number.isSafeInteger(candidate) && candidate >= 0 ? candidate : null;
-    };
-    const total = tokenNumber(source.text_total_tokens ?? source.total_tokens ?? source.totalTokens ??
-      source.token_count ?? source.tokenCount ?? source.tokens);
-    const uncached = tokenNumber(source.uncached_text_input_tokens);
-    const cached = tokenNumber(source.cached_text_input_tokens);
-    const output = tokenNumber(source.text_output_tokens);
-    if ([uncached, cached, output].some((value) => value === null)) return total;
-    const sum = uncached + cached + output;
-    if (total !== null && total > 0) return total;
-    return Number.isSafeInteger(sum) ? sum : total;
-  }
-
-  function dailyRecord(row) {
-    if (!object(row)) return null;
-    const day = rowDay(row.date ?? row.day ?? row.usage_date ?? row.usageDate ?? row.bucket_date);
-    if (!day) return null;
-    const product = row.product_surface ?? row.productSurface ?? row.product;
-    if (typeof product === "string" && !/codex/i.test(product)) return null;
-    for (const source of [row.totals, row.usage, row.token_usage, row]) {
-      const tokens = tokenCount(source);
-      if (tokens !== null) return { day, tokens };
-    }
-    return null;
-  }
-
-  function parseToday(payload, now = Date.now()) {
-    const day = localDay(now);
-    const rows = dailyRecords(payload);
-    if (!day || !rows) return null;
-    let tokens = 0;
-    let found = false;
-    for (const row of rows) {
-      const record = dailyRecord(row);
-      if (!record || record.day !== day) continue;
-      if (!Number.isSafeInteger(tokens + record.tokens)) return null;
-      tokens += record.tokens;
-      found = true;
-    }
-    return found ? { tokens, day } : null;
-  }
-
-  function analyticsSchema(payload) {
-    const rootKeys = object(payload) ? Object.keys(payload).slice(0, 32) : [];
-    const rows = dailyRecords(payload);
-    const safeKeys = (keys) => keys.map((key) => key.slice(0, 80));
-    return {
-      httpStatus: 200,
-      isArray: Array.isArray(payload),
-      rootType: payload === null ? "null" : Array.isArray(payload) ? "array" : typeof payload,
-      rootKeys: safeKeys(rootKeys),
-      rootFieldTypes: Object.fromEntries(rootKeys.map((key) => [key.slice(0, 80),
-        payload[key] === null ? "null" : Array.isArray(payload[key]) ? "array" : typeof payload[key]])),
-      firstRecordKeys: object(rows?.[0]) ? safeKeys(Object.keys(rows[0]).slice(0, 32)) : [],
-      at: new Date().toISOString()
-    };
-  }
-
   function diagnostic(stage, code, status = null) {
     return { stage, status, code, at: new Date().toISOString() };
   }
@@ -204,14 +110,6 @@
     return { accessToken, accountId };
   }
 
-  function dailyUrl(now) {
-    const url = new URL(DAILY_URL);
-    url.searchParams.set("start_date", localDay(now));
-    url.searchParams.set("end_date", nextLocalDay(now)); // Exclusive end date.
-    url.searchParams.set("group_by", "day");
-    return url.toString();
-  }
-
   async function loadUsage(now = Date.now()) {
     const diagnostics = [];
     let auth;
@@ -223,45 +121,31 @@
       return { snapshot: null, diagnostics };
     }
 
-    // Both sources settle independently; a failed analytics request cannot hide quota data.
-    const [quotaResult, analyticsResult] = await Promise.allSettled([
-      requestJson(USAGE_URL, "quota", auth),
-      requestJson(dailyUrl(now), "analytics", auth)
-    ]);
+    let quota;
+    try {
+      quota = await requestJson(USAGE_URL, "quota", auth);
+    } catch (error) {
+      auth = null;
+      diagnostics.push(error?.diagnostic ?? diagnostic("quota", "UNKNOWN_ERROR"));
+      return { snapshot: null, diagnostics };
+    }
     // Drop our explicit reference to the token before returning any result.
     auth = null;
 
-    let limits = null;
-    if (quotaResult.status === "fulfilled") {
-      limits = parseLimits(quotaResult.value);
-      if (!limits) diagnostics.push(diagnostic("parsing", "QUOTA_UNRECOGNIZED"));
-    } else {
-      diagnostics.push(quotaResult.reason?.diagnostic ?? diagnostic("quota", "UNKNOWN_ERROR"));
-    }
-
-    let today = null;
-    if (analyticsResult.status === "fulfilled") {
-      today = parseToday(analyticsResult.value, now);
-      if (!today) {
-        diagnostics.push(diagnostic("parsing", "ANALYTICS_UNRECOGNIZED"));
-        console.warn("[Codex Usage HUD] analytics schema:", analyticsSchema(analyticsResult.value));
-      }
-    } else {
-      diagnostics.push(analyticsResult.reason?.diagnostic ?? diagnostic("analytics", "UNKNOWN_ERROR"));
-    }
+    const limits = parseLimits(quota);
+    if (!limits) diagnostics.push(diagnostic("parsing", "QUOTA_UNRECOGNIZED"));
 
     return {
-      snapshot: limits || today ? {
-        fiveHour: limits?.fiveHour ?? null,
-        weekly: limits?.weekly ?? null,
-        today,
+      snapshot: limits ? {
+        fiveHour: limits.fiveHour,
+        weekly: limits.weekly,
         updatedAt: new Date(now).toISOString()
       } : null,
       diagnostics
     };
   }
 
-  const client = { loadUsage, parseLimits, parseToday, resetTime, dailyUrl };
+  const client = { loadUsage, parseLimits, resetTime };
   globalThis.CodexUsageClient = client;
   if (typeof module !== "undefined" && module.exports) module.exports = client;
 })();

@@ -8,36 +8,35 @@ afterEach(() => { global.fetch = originalFetch; });
 const windowValue = (seconds, used) => ({ limit_window_seconds: seconds, used_percent: used, reset_at: 1_800_000_000 });
 const response = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
 
-function mockRequests({ session = { accessToken: "test-token", account: { id: "account-1" } }, quota, analytics, quotaStatus = 200, analyticsStatus = 200 }) {
+function mockRequests({ session = { accessToken: "test-token", account: { id: "account-1" } }, quota, quotaStatus = 200 }) {
   const calls = [];
   global.fetch = async (url, options) => {
     calls.push({ url, options });
     if (url.endsWith("/api/auth/session")) return response(session);
     if (url.endsWith("/wham/usage")) return response(quota, quotaStatus);
-    return response(analytics, analyticsStatus);
+    throw new Error("Unexpected request");
   };
   return calls;
 }
 
-test("maps primary 5h and secondary weekly windows by duration", () => {
-  const limits = client.parseLimits({ rate_limit: {
-    primary_window: windowValue(18000, 34.4),
-    secondary_window: windowValue(604800, 18)
-  } });
-  assert.deepEqual(limits, {
-    fiveHour: { usedPercent: 34.4, resetAt: "2027-01-15T08:00:00.000Z" },
-    weekly: { usedPercent: 18, resetAt: "2027-01-15T08:00:00.000Z" }
+test("maps 5h and weekly quota windows by duration", () => {
+  assert.deepEqual(client.parseLimits({ rate_limit: {
+    primary_window: windowValue(18000, 30),
+    secondary_window: windowValue(604800, 5)
+  } }), {
+    fiveHour: { usedPercent: 30, resetAt: "2027-01-15T08:00:00.000Z" },
+    weekly: { usedPercent: 5, resetAt: "2027-01-15T08:00:00.000Z" }
   });
 });
 
-test("maps a primary weekly window without inventing a 5h value", () => {
+test("maps a primary weekly window without inventing 5h data", () => {
   assert.deepEqual(client.parseLimits({ rate_limit: { primary_window: windowValue(604800, 20) } }), {
     fiveHour: null,
     weekly: { usedPercent: 20, resetAt: "2027-01-15T08:00:00.000Z" }
   });
 });
 
-test("finds additional limits and tolerates a missing secondary window", () => {
+test("finds additional windows and tolerates a missing secondary window", () => {
   assert.deepEqual(client.parseLimits({
     rate_limit: { primary_window: windowValue(18000, 40) },
     additional_rate_limits: [{ rate_limit: { primary_window: windowValue(604800, 15) } }]
@@ -48,165 +47,56 @@ test("finds additional limits and tolerates a missing secondary window", () => {
   assert.equal(client.parseLimits({ rate_limit: { primary_window: windowValue(18000, 40) } }).weekly, null);
 });
 
-test("rejects malformed and unlabelled rate windows", () => {
+test("rejects malformed, unlabelled, and out-of-range quota values", () => {
   assert.equal(client.parseLimits(null), null);
   assert.equal(client.parseLimits({ rate_limit: { primary_window: { used_percent: 34 } } }), null);
   assert.equal(client.parseLimits({ rate_limit: { primary_window: { limit_window_seconds: 18000, used_percent: "34" } } }), null);
+  assert.equal(client.parseLimits({ rate_limit: { primary_window: windowValue(18000, 101) } }).fiveHour.usedPercent, null);
 });
 
-test("analytics parser counts only valid Codex token rows for today", () => {
-  const now = new Date(2026, 9, 15, 12).getTime();
-  const day = client.parseToday([{ date: "2026-10-15", total_tokens: 1 }], now).day;
-  assert.deepEqual(client.parseToday({ data: [
-    { date: day, product: "codex", total_tokens: 400 },
-    { date: day, product: "codex", usage: { total_tokens: 28 } },
-    { date: day, product: "chat", total_tokens: 999 },
-    { date: "2026-10-14", product: "codex", total_tokens: 100 },
-    { date: day, product: "codex", total_tokens: "50" }
-  ] }, now), { tokens: 478, day });
-  assert.equal(client.parseToday({ data: [{ date: day, request_count: 10 }] }, now), null);
-  assert.equal(client.parseToday({}, now), null);
-  const url = new URL(client.dailyUrl(now));
-  assert.equal(url.searchParams.get("start_date"), day);
-  assert.equal(url.searchParams.get("group_by"), "day");
-  assert.equal(url.searchParams.get("end_date"), "2026-10-16");
-});
-
-test("analytics data.totals supports reported total and token components", () => {
-  const now = new Date(2026, 9, 15, 12).getTime();
-  const payload = { data: [
-    { date: "2026-10-14", totals: { text_total_tokens: 999999 } },
-    { date: "2026-10-15", totals: {
-      uncached_text_input_tokens: 200000,
-      cached_text_input_tokens: 180000,
-      text_output_tokens: 48000,
-      credits: 12,
-      turns: 9
-    } }
-  ] };
-  assert.deepEqual(client.parseToday(payload, now), { day: "2026-10-15", tokens: 428000 });
-  assert.deepEqual(client.parseToday({ data: [{ date: "2026-10-15", totals: {
-    text_total_tokens: 1200000,
-    uncached_text_input_tokens: 100,
-    cached_text_input_tokens: 100,
-    text_output_tokens: 100
-  } }] }, now), { day: "2026-10-15", tokens: 1200000 });
-  assert.equal(format.tokens(1200000), "1.2M");
-});
-
-test("analytics finds today in multiple wrappers and sums matching records", () => {
-  const now = new Date(2026, 9, 15, 12).getTime();
-  const rows = [
-    { date: "2026-10-14", totals: { text_total_tokens: 500 } },
-    { date: "2026-10-15", totals: { text_total_tokens: 300 } },
-    { date: "2026-10-15", totals: { text_total_tokens: 128 } }
-  ];
-  assert.deepEqual(client.parseToday(rows, now), { day: "2026-10-15", tokens: 428 });
-  assert.deepEqual(client.parseToday({ data: { records: rows } }, now), { day: "2026-10-15", tokens: 428 });
-});
-
-test("analytics returns unavailable for empty, unknown, or malformed token data", () => {
-  const now = new Date(2026, 9, 15, 12).getTime();
-  assert.equal(client.parseToday({ data: [] }, now), null);
-  assert.equal(client.parseToday({ unexpected: [{ date: "2026-10-15", total_tokens: 1 }] }, now), null);
-  assert.equal(client.parseToday(null, now), null);
-  assert.equal(client.parseToday({ data: [{ date: "2026-10-15", totals: { credits: 3, turns: 2 } }] }, now), null);
-  assert.equal(client.parseToday({ data: [{ date: "2026-10-15", totals: {
-    uncached_text_input_tokens: 4, text_output_tokens: 2
-  } }] }, now), null);
-  assert.deepEqual(client.parseToday({ data: [{ date: "2026-10-15", totals: { text_total_tokens: 0 } }] }, now), {
-    day: "2026-10-15", tokens: 0
-  });
-});
-
-test("formats missing values, compact tokens, and resets", () => {
-  assert.equal(format.percent(34.4), "34%");
-  assert.equal(format.percent("34"), "—");
-  assert.equal(format.tokens(428000), "428K");
-  assert.equal(format.tokens(undefined), "—");
+test("formats percentages and reset values safely", () => {
+  assert.equal(format.percent(30.4), "30%");
+  assert.equal(format.percent(null), "—");
+  assert.equal(format.percent(-1), "—");
+  assert.equal(format.percent(101), "—");
+  assert.equal(format.validPercent(NaN), false);
   const now = Date.parse("2026-10-15T10:00:00Z");
   assert.equal(format.reset("2026-10-15T12:17:00Z", now), "02:17");
   assert.equal(format.reset("2026-10-19T22:00:00Z", now), "4d 12h");
   assert.equal(format.reset(null, now), "—");
 });
 
-test("session token stays in request memory; quota survives analytics HTTP error", async () => {
-  const now = new Date(2026, 9, 15, 12).getTime();
-  const calls = mockRequests({
-    quota: { rate_limit: { primary_window: windowValue(18000, 25) } },
-    analyticsStatus: 400
-  });
-  const result = await client.loadUsage(now);
-  assert.equal(result.snapshot.fiveHour.usedPercent, 25);
-  assert.equal(result.snapshot.today, null);
-  assert.deepEqual(result.diagnostics.map(({ stage, status, code }) => ({ stage, status, code })), [
-    { stage: "analytics", status: 400, code: "HTTP_ERROR" }
-  ]);
+test("loadUsage makes only session and quota requests with a temporary token", async () => {
+  const calls = mockRequests({ quota: { rate_limit: {
+    primary_window: windowValue(18000, 30),
+    secondary_window: windowValue(604800, 5)
+  } } });
+  const result = await client.loadUsage(new Date(2026, 9, 15, 12).getTime());
+  assert.equal(calls.length, 2);
   assert.equal(calls[0].options.headers.Authorization, undefined);
   assert.equal(calls[1].options.headers.Authorization, "Bearer test-token");
   assert.equal(calls[1].options.headers["ChatGPT-Account-Id"], "account-1");
-  assert.equal(calls[2].options.headers.Authorization, "Bearer test-token");
+  assert.deepEqual(Object.keys(result.snapshot).sort(), ["fiveHour", "updatedAt", "weekly"]);
   assert.equal(JSON.stringify(result).includes("test-token"), false);
-});
-
-test("analytics survives quota HTTP error", async () => {
-  const now = new Date(2026, 9, 15, 12).getTime();
-  const day = client.parseToday([{ date: "2026-10-15", total_tokens: 1 }], now).day;
-  mockRequests({ quotaStatus: 403, analytics: { data: [{ date: day, total_tokens: 1234 }] } });
-  const result = await client.loadUsage(now);
-  assert.equal(result.snapshot.fiveHour, null);
-  assert.equal(result.snapshot.today.tokens, 1234);
-  assert.equal(result.diagnostics[0].stage, "quota");
-  assert.equal(result.diagnostics[0].status, 403);
-});
-
-test("combines quota and analytics when both endpoints succeed", async () => {
-  const now = new Date(2026, 9, 15, 12).getTime();
-  const day = client.parseToday([{ date: "2026-10-15", total_tokens: 1 }], now).day;
-  mockRequests({
-    quota: { rate_limit: { primary_window: windowValue(18000, 50), secondary_window: windowValue(604800, 10) } },
-    analytics: { data: [{ date: day, totals: {
-      uncached_text_input_tokens: 1000,
-      cached_text_input_tokens: 200,
-      text_output_tokens: 34
-    } }] }
-  });
-  const result = await client.loadUsage(now);
-  assert.equal(result.snapshot.fiveHour.usedPercent, 50);
-  assert.equal(result.snapshot.weekly.usedPercent, 10);
-  assert.equal(result.snapshot.today.tokens, 1234);
   assert.deepEqual(result.diagnostics, []);
 });
 
-test("analytics schema warning contains keys and types, never response values", async () => {
-  const oldWarn = console.warn;
-  const warnings = [];
-  console.warn = (...args) => warnings.push(args);
-  try {
-    mockRequests({
-      quota: { rate_limit: { primary_window: windowValue(18000, 25) } },
-      analytics: { data: [{ date: "2026-10-15", totals: { credits: 3 }, secret: "private-value" }] }
-    });
-    const result = await client.loadUsage(new Date(2026, 9, 15, 12).getTime());
-    assert.equal(result.snapshot.fiveHour.usedPercent, 25);
-    assert.equal(result.snapshot.today, null);
-    assert.equal(result.diagnostics[0].code, "ANALYTICS_UNRECOGNIZED");
-    assert.equal(warnings[0][0], "[Codex Usage HUD] analytics schema:");
-    assert.deepEqual(warnings[0][1].rootKeys, ["data"]);
-    assert.ok(warnings[0][1].firstRecordKeys.includes("totals"));
-    assert.equal(JSON.stringify(warnings).includes("private-value"), false);
-  } finally {
-    console.warn = oldWarn;
-  }
+test("session and quota failures return safe diagnostics", async () => {
+  mockRequests({ session: { user: { name: "Example" } } });
+  const missingSession = await client.loadUsage();
+  assert.equal(missingSession.snapshot, null);
+  assert.equal(missingSession.diagnostics[0].code, "NO_ACCESS_TOKEN");
+  const calls = mockRequests({ quotaStatus: 403 });
+  const quotaFailure = await client.loadUsage();
+  assert.equal(calls.length, 2);
+  assert.equal(quotaFailure.snapshot, null);
+  assert.equal(quotaFailure.diagnostics[0].stage, "quota");
+  assert.equal(quotaFailure.diagnostics[0].status, 403);
 });
 
-test("missing session token and two failed sources return safe diagnostics", async () => {
-  mockRequests({ session: { user: { name: "Example" } } });
-  const sessionResult = await client.loadUsage();
-  assert.equal(sessionResult.snapshot, null);
-  assert.equal(sessionResult.diagnostics[0].code, "NO_ACCESS_TOKEN");
-  mockRequests({ quotaStatus: 401, analyticsStatus: 400 });
+test("unrecognized quota response remains unavailable", async () => {
+  mockRequests({ quota: { rate_limit: {} } });
   const result = await client.loadUsage();
   assert.equal(result.snapshot, null);
-  assert.deepEqual(result.diagnostics.map((item) => item.stage), ["quota", "analytics"]);
+  assert.equal(result.diagnostics[0].code, "QUOTA_UNRECOGNIZED");
 });
